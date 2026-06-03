@@ -1,0 +1,28 @@
+# Деплой NODE-сервера: только агент-сборщик (ROLE=node), без БД.
+# Узел собирает метрики хоста+Docker и пушит на BASE.
+# Запуск:  docker compose -f docker-compose.node.yml up -d --build
+# Требует .env рядом: SERVER_NAME (уникальное), API_KEY (как на base), BASE_URL.
+services:
+  node:
+    build: .
+    restart: unless-stopped
+    environment:
+      ROLE: node
+      SERVER_NAME: ${SERVER_NAME:?задайте уникальное SERVER_NAME}
+      API_KEY: ${API_KEY:?задайте API_KEY (тот же, что на base)}
+      BASE_URL: ${BASE_URL:?задайте BASE_URL, напр. http://base-host:8080}
+      PUSH_INTERVAL: ${PUSH_INTERVAL:-2}
+      # Хост-метрики (Linux)
+      HOST_PROC: /host/proc
+      DISK_PATH: /host/root
+      # DB_* нода не использует, но поля обязательны в конфиге — заглушки:
+      DB_HOST: unused
+      DB_PORT: "5432"
+      DB_NAME: unused
+      DB_USER: unused
+      DB_PASS: unused
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+      - /:/host/root:ro
+    pid: host

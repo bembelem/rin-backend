@@ -1,0 +1,884 @@
+openapi: "3.1.0"
+
+info:
+  title: RIN Watchdog API
+  version: "0.2.0"
+  description: |
+    Распределённая система мониторинга серверов и Docker-контейнеров.
+
+    ## Модель сбора метрик
+
+    Система построена по **push-модели с централизованным агрегатором**
+    (топология hub-and-spoke): периферийные узлы сами инициируют отправку
+    метрик на центральный узел. В отличие от pull-модели (например, Prometheus,
+    где центральный сервер опрашивает узлы), push выбран потому, что узлы могут
+    находиться за NAT/фаерволом и недоступны для входящих соединений — исходящий
+    же трафик на центр проходит через NAT без дополнительной настройки.
+
+    ## Роли инстансов
+
+    | Роль | Назначение |
+    |------|-----------|
+    | `ROLE=base` | Центральный агрегатор: реестр узлов, ретрансляция метрик по WebSocket, хранение истории (PostgreSQL), выдача API-ключей, сбор своих метрик. Доступен через nginx по `https://bromage.ru`. |
+    | `ROLE=node` | Периферийный сборщик: снимает метрики хоста и Docker, отправляет (push) на Base через `POST /metrics/push`. |
+
+    ## Жизненный цикл ноды
+
+    1. Администратор получает ключ: `GET /key` на Base.
+    2. Вставляет ключ в `.env` нового Node-инстанса (`API_KEY=...`).
+    3. При старте нода вызывает `POST /register` на Base.
+    4. Нода периодически пушит метрики: `POST /metrics/push`.
+    5. Дашборд получает `GET /servers`, затем открывает `WS /metrics` на Base —
+       Base транслирует снимки всех зарегистрированных серверов.
+
+    ## Основной канал метрик
+
+    **WebSocket `/metrics`** (исторический алиас — `/ws`) — потоковые метрики
+    каждые `WS_INTERVAL` секунд (по умолчанию 2 с).
+    **`GET /metrics`** — одноразовый снимок для первичной загрузки UI.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальная разработка
+  - url: https://bromage.ru
+    description: Production — Base-инстанс (через nginx)
+
+tags:
+  - name: System
+    description: Хелс-чек, снимки метрик, список серверов
+  - name: Auth
+    description: Получение и управление API-ключом (только Base)
+  - name: Node
+    description: Эндпоинты для регистрации нод и пуша метрик (требуют X-API-Key)
+  - name: Realtime
+    description: WebSocket — потоковые метрики
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security: []   # большинство эндпоинтов публичны; защищённые переопределяют ниже
+
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Ключ из `.env` файла инстанса (`API_KEY`).
+        Получить существующий ключ Base-инстанса: `GET /key`.
+
+  # ── Schemas ────────────────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Primitive sub-objects ────────────────────────────────────────────────
+
+    MemoryInfo:
+      type: object
+      required: [used_mb, total_mb, percent]
+      description: |
+        Информация об оперативной памяти.
+        Инвариант: `used_mb <= total_mb`.
+      properties:
+        used_mb:
+          type: integer
+          minimum: 0
+          description: Используемая память, МБ (>= 0, <= total_mb)
+          example: 4096
+        total_mb:
+          type: integer
+          minimum: 1
+          description: Общая память, МБ (> 0)
+          example: 16384
+        percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Процент использования (0–100)
+          example: 25.0
+
+    DiskInfo:
+      type: object
+      required: [used_gb, total_gb, percent]
+      description: |
+        Информация о дисковом пространстве.
+        Инвариант: `used_gb <= total_gb`.
+      properties:
+        used_gb:
+          type: number
+          minimum: 0
+          description: Используемое место, ГБ (>= 0, <= total_gb)
+          example: 120.5
+        total_gb:
+          type: number
+          exclusiveMinimum: 0
+          description: Общий объём диска, ГБ (> 0)
+          example: 500.0
+        percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Процент использования (0–100)
+          example: 24.1
+
+    NetworkInfo:
+      type: object
+      required: [rx_bytes, tx_bytes, rx_mb_per_sec, tx_mb_per_sec]
+      properties:
+        rx_bytes:
+          type: integer
+          minimum: 0
+          description: Входящий трафик, байт (накопленный, >= 0)
+          example: 1048576
+        tx_bytes:
+          type: integer
+          minimum: 0
+          description: Исходящий трафик, байт (накопленный, >= 0)
+          example: 524288
+        rx_mb_per_sec:
+          type: number
+          minimum: 0
+          description: Входящий трафик, МБ/с (>= 0)
+          example: 1.2
+        tx_mb_per_sec:
+          type: number
+          minimum: 0
+          description: Исходящий трафик, МБ/с (>= 0)
+          example: 0.5
+
+    # Вывод (WS/REST). Поля сериализуются как 1m/5m/15m — контракт фронта.
+    LoadAverage:
+      type: object
+      required: ["1m", "5m", "15m"]
+      properties:
+        "1m":
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 1 минуту (null на Windows)
+          example: 0.12
+        "5m":
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 5 минут (null на Windows)
+          example: 0.08
+        "15m":
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 15 минут (null на Windows)
+          example: 0.05
+
+    # Вход (POST /metrics/push). Нода шлёт внутренние имена полей.
+    LoadAverageInput:
+      type: object
+      required: [min_1, min_5, min_15]
+      properties:
+        min_1:
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 1 минуту (null на Windows)
+          example: 0.12
+        min_5:
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 5 минут (null на Windows)
+          example: 0.08
+        min_15:
+          type: number
+          nullable: true
+          minimum: 0
+          description: Средняя нагрузка за 15 минут (null на Windows)
+          example: 0.05
+
+    ContainerInfo:
+      type: object
+      required: [id, name, status, image, cpu_percent, memory_mb, memory_limit_mb, net_rx_bytes, net_tx_bytes]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: ID контейнера (короткий 12 или полный 64 символа)
+          example: a1b2c3d4e5f6
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя контейнера
+          example: nginx
+        status:
+          type: string
+          enum: [created, running, paused, restarting, removing, exited, dead]
+          description: Статус контейнера (один из Docker container states)
+          example: running
+        image:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Docker-образ
+          example: "nginx:latest"
+        cpu_percent:
+          type: number
+          minimum: 0
+          description: |
+            Загрузка CPU контейнера, % (>= 0).
+            Может превышать 100 при использовании нескольких ядер
+            (Docker суммирует загрузку по ядрам).
+          example: 0.1
+        memory_mb:
+          type: integer
+          minimum: 0
+          description: Используемая память, МБ (>= 0)
+          example: 128
+        memory_limit_mb:
+          type: integer
+          minimum: 0
+          description: Лимит памяти, МБ (>= 0; 0 = без лимита)
+          example: 512
+        net_rx_bytes:
+          type: integer
+          minimum: 0
+          description: Входящий трафик контейнера, байт (накопленный, >= 0)
+          example: 1024
+        net_tx_bytes:
+          type: integer
+          minimum: 0
+          description: Исходящий трафик контейнера, байт (накопленный, >= 0)
+          example: 512
+
+    ServerInfo:
+      type: object
+      required: [name, ip]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя сервера (SERVER_NAME из .env)
+          example: bromage-node-1
+        ip:
+          type: string
+          minLength: 1
+          maxLength: 45
+          description: IP-адрес сервера (IPv4/IPv6)
+          example: "192.168.1.20"
+
+    # ── Composite metric schemas ─────────────────────────────────────────────
+
+    ServerMetricsSchema:
+      type: object
+      description: Полный снимок метрик сервера — хост + Docker-контейнеры
+      required:
+        - name
+        - ip
+        - status
+        - timestamp
+        - cpu_percent
+        - memory
+        - disk
+        - network
+        - load_average
+        - uptime_seconds
+        - containers
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя сервера (SERVER_NAME из .env)
+          example: bromage-base
+        ip:
+          type: string
+          nullable: true
+          maxLength: 45
+          description: IP-адрес сервера (null если неизвестен)
+          example: "192.168.1.10"
+        status:
+          type: string
+          enum: [up, down]
+          description: Статус сервера
+          example: up
+        timestamp:
+          type: string
+          format: date-time
+          description: Время снятия метрик (UTC, ISO-8601)
+          example: "2026-05-25T12:00:00Z"
+        cpu_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Средняя загрузка всех ядер CPU, % (0–100)
+          example: 3.5
+        memory:
+          $ref: "#/components/schemas/MemoryInfo"
+        disk:
+          $ref: "#/components/schemas/DiskInfo"
+        network:
+          $ref: "#/components/schemas/NetworkInfo"
+        load_average:
+          $ref: "#/components/schemas/LoadAverage"
+        uptime_seconds:
+          type: integer
+          minimum: 0
+          description: Аптайм системы, секунды (>= 0)
+          example: 86400
+        temperature_c:
+          type: number
+          nullable: true
+          minimum: -50
+          maximum: 150
+          description: Температура CPU, °C (null если датчик недоступен; диапазон -50..150)
+          example: 42.0
+        containers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContainerInfo"
+          description: Список Docker-контейнеров на хосте
+
+    SystemMetricsSchema:
+      type: object
+      description: Метрики хоста без Docker-контейнеров (mode=system)
+      required:
+        - name
+        - ip
+        - status
+        - timestamp
+        - cpu_percent
+        - memory
+        - disk
+        - network
+        - load_average
+        - uptime_seconds
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя сервера (SERVER_NAME из .env)
+          example: bromage-base
+        ip:
+          type: string
+          nullable: true
+          maxLength: 45
+          example: "192.168.1.10"
+        status:
+          type: string
+          enum: [up, down]
+          example: up
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-05-25T12:00:00Z"
+        cpu_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 3.5
+        memory:
+          $ref: "#/components/schemas/MemoryInfo"
+        disk:
+          $ref: "#/components/schemas/DiskInfo"
+        network:
+          $ref: "#/components/schemas/NetworkInfo"
+        load_average:
+          $ref: "#/components/schemas/LoadAverage"
+        uptime_seconds:
+          type: integer
+          minimum: 0
+          example: 86400
+        temperature_c:
+          type: number
+          nullable: true
+          minimum: -50
+          maximum: 150
+          example: 42.0
+
+    DockerMetricsSchema:
+      type: object
+      description: Только Docker-контейнеры (mode=docker)
+      required: [name, containers]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя сервера (SERVER_NAME из .env)
+          example: bromage-base
+        containers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContainerInfo"
+
+    ServerMetricsRequest:
+      type: object
+      description: |
+        Тело запроса `POST /metrics/push` (нода → Base).
+
+        Валидация:
+        - `server_name`: непустая строка, 1–255 символов.
+        - `status`: один из `up`, `down`.
+        - `timestamp`: ISO-8601 (UTC).
+        - `cpu_percent`: 0–100.
+        - `memory.used_mb <= memory.total_mb`, `memory.percent` 0–100.
+        - `disk.used_gb <= disk.total_gb`, `disk.percent` 0–100.
+        - `network.*`, `load_average.*`, `uptime_seconds`: неотрицательные.
+        - `temperature_c`: null или -50…150.
+        - `containers[*]`: см. `ContainerInfo`.
+      required:
+        - server_name
+        - status
+        - timestamp
+        - cpu_percent
+        - memory
+        - disk
+        - network
+        - load_average
+        - uptime_seconds
+        - containers
+      properties:
+        server_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Имя ноды (SERVER_NAME из .env)
+          example: bromage-node-1
+        status:
+          type: string
+          enum: [up, down]
+          description: Статус сервера
+          example: up
+        timestamp:
+          type: string
+          format: date-time
+          description: Время снятия метрик (UTC, ISO-8601)
+          example: "2026-05-25T12:00:00Z"
+        cpu_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Средняя загрузка всех ядер CPU, % (0–100)
+          example: 1.2
+        memory:
+          $ref: "#/components/schemas/MemoryInfo"
+        disk:
+          $ref: "#/components/schemas/DiskInfo"
+        network:
+          $ref: "#/components/schemas/NetworkInfo"
+        load_average:
+          $ref: "#/components/schemas/LoadAverageInput"
+        uptime_seconds:
+          type: integer
+          minimum: 0
+          description: Аптайм системы, секунды (>= 0)
+          example: 3600
+        temperature_c:
+          type: number
+          nullable: true
+          minimum: -50
+          maximum: 150
+          description: Температура CPU, °C (null если датчик недоступен; диапазон -50..150)
+          example: null
+        containers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContainerInfo"
+          description: Список Docker-контейнеров на хосте
+
+    # ── Response wrappers ────────────────────────────────────────────────────
+
+    ServersResponse:
+      type: object
+      required: [count, servers]
+      properties:
+        count:
+          type: integer
+          description: Количество зарегистрированных серверов
+          example: 2
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ServerInfo"
+
+    HealthResponse:
+      type: object
+      required: [status, server]
+      properties:
+        status:
+          type: string
+          example: ok
+        server:
+          type: string
+          description: Имя этого инстанса (SERVER_NAME из .env)
+          example: bromage-base
+
+    KeyResponse:
+      type: object
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          description: API-ключ для вставки в .env ноды (API_KEY=...)
+          example: "a3f8c2d1e9b74f6a..."
+
+    StatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    WsFrame:
+      type: object
+      description: JSON-кадр WebSocket-стрима
+      required: [action, data]
+      properties:
+        action:
+          type: string
+          enum: [snapshot]
+          description: Тип кадра (сейчас только snapshot)
+          example: snapshot
+        data:
+          $ref: "#/components/schemas/ServerMetricsSchema"
+
+    ErrorResponse:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Описание ошибки
+          example: Server not registered
+
+  # ── Reusable responses ────────────────────────────────────────────────────
+
+  responses:
+
+    Unauthorized:
+      description: Неверный или отсутствующий API-ключ
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: Invalid API key
+
+    Forbidden:
+      description: Сервер не зарегистрирован в реестре Base
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: Server not registered
+
+    NoMetricsYet:
+      description: Метрики ещё не собраны (агент только что запустился)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: No metrics collected yet
+
+    ValidationError:
+      description: Ошибка валидации тела запроса или параметров
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    loc:
+                      type: array
+                      items:
+                        type: string
+                    msg:
+                      type: string
+                    type:
+                      type: string
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+
+  /health:
+    get:
+      tags: [System]
+      operationId: health
+      summary: Хелс-чек
+      description: |
+        Проверяет доступность агента.
+        Дашборд вызывает этот эндпоинт перед установкой WebSocket-соединения.
+
+        Доступен на **обеих ролях**: base и node.
+      responses:
+        "200":
+          description: Агент жив
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                server: bromage-base
+
+  /metrics:
+    get:
+      tags: [System]
+      operationId: getMetrics
+      summary: Снимок метрик
+      description: |
+        Возвращает последний закешированный снимок метрик из in-memory репозитория.
+
+        Поведение параметра `mode`:
+        - не передан → полный снимок (`ServerMetricsSchema`)
+        - `system`   → только метрики хоста, без контейнеров (`SystemMetricsSchema`)
+        - `docker`   → только список контейнеров (`DockerMetricsSchema`)
+
+        Доступен на **обеих ролях**: base и node.
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [system, docker]
+          description: Фильтр вывода метрик.
+      responses:
+        "200":
+          description: Снимок метрик
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ServerMetricsSchema"
+                  - $ref: "#/components/schemas/SystemMetricsSchema"
+                  - $ref: "#/components/schemas/DockerMetricsSchema"
+              examples:
+                full:
+                  summary: Полный снимок (mode не задан)
+                  value:
+                    name: bromage-base
+                    ip: "192.168.1.10"
+                    status: up
+                    timestamp: "2026-05-25T12:00:00Z"
+                    cpu_percent: 3.5
+                    memory: { used_mb: 4096, total_mb: 16384, percent: 25.0 }
+                    disk: { used_gb: 120.5, total_gb: 500.0, percent: 24.1 }
+                    network: { rx_bytes: 1048576, tx_bytes: 524288, rx_mb_per_sec: 1.2, tx_mb_per_sec: 0.5 }
+                    load_average: { "1m": 0.12, "5m": 0.08, "15m": 0.05 }
+                    uptime_seconds: 86400
+                    temperature_c: 42.0
+                    containers:
+                      - id: a1b2c3d4e5f6
+                        name: nginx
+                        status: running
+                        image: "nginx:latest"
+                        cpu_percent: 0.1
+                        memory_mb: 128
+                        memory_limit_mb: 512
+                        net_rx_bytes: 1024
+                        net_tx_bytes: 512
+                system_only:
+                  summary: mode=system
+                  value:
+                    name: bromage-base
+                    ip: "192.168.1.10"
+                    status: up
+                    timestamp: "2026-05-25T12:00:00Z"
+                    cpu_percent: 3.5
+                    memory: { used_mb: 4096, total_mb: 16384, percent: 25.0 }
+                    disk: { used_gb: 120.5, total_gb: 500.0, percent: 24.1 }
+                    network: { rx_bytes: 1048576, tx_bytes: 524288, rx_mb_per_sec: 1.2, tx_mb_per_sec: 0.5 }
+                    load_average: { "1m": 0.12, "5m": 0.08, "15m": 0.05 }
+                    uptime_seconds: 86400
+                    temperature_c: 42.0
+                docker_only:
+                  summary: mode=docker
+                  value:
+                    name: bromage-base
+                    containers:
+                      - id: a1b2c3d4e5f6
+                        name: nginx
+                        status: running
+                        image: "nginx:latest"
+                        cpu_percent: 0.1
+                        memory_mb: 128
+                        memory_limit_mb: 512
+                        net_rx_bytes: 1024
+                        net_tx_bytes: 512
+        "503":
+          $ref: "#/components/responses/NoMetricsYet"
+
+  /key:
+    get:
+      tags: [Auth]
+      operationId: getApiKey
+      summary: Получить API-ключ
+      description: |
+        Возвращает текущий `API_KEY` Base-инстанса.
+
+        **Только ROLE=base.** Администратор вызывает этот эндпоинт однократно,
+        чтобы получить ключ для вставки в `.env` новых Node-инстансов.
+
+        > ⚠️ Эндпоинт должен быть закрыт от публичного доступа на уровне nginx
+        > (например, доступен только из локальной сети или по отдельному паролю).
+      responses:
+        "200":
+          description: API-ключ Base-инстанса
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyResponse"
+              example:
+                api_key: "a3f8c2d1e9b74f6a8c3d2e1f0b9a8765"
+
+  /register:
+    post:
+      tags: [Node]
+      operationId: registerNode
+      summary: Регистрация ноды на Base
+      description: |
+        Node-инстанс вызывает этот эндпоинт **при старте**, чтобы зарегистрироваться
+        в реестре Base.
+
+        - IP фиксируется из `request.client.host` (не из тела).
+        - После регистрации нода получает право пушить метрики через `POST /metrics/push`.
+
+        **Только ROLE=base принимает этот запрос.**
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: server_name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Имя ноды (берётся из `SERVER_NAME` в `.env` ноды).
+          example: bromage-node-1
+      responses:
+        "200":
+          description: Нода зарегистрирована
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              example:
+                status: ok
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /metrics/push:
+    post:
+      tags: [Node]
+      operationId: pushMetrics
+      summary: Пуш метрик от ноды на Base
+      description: |
+        Node-инстанс периодически отправляет снимок своих метрик на Base.
+
+        **Предусловия:**
+        1. Нода предварительно зарегистрирована через `POST /register`.
+        2. IP запроса совпадает с IP, зафиксированным при регистрации.
+
+        После приёма метрики попадают в in-memory репозиторий Base и
+        транслируются всем подключённым WebSocket-клиентам (`/metrics`).
+
+        **Только ROLE=base принимает этот запрос.**
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServerMetricsRequest"
+      responses:
+        "200":
+          description: Метрики приняты
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              example:
+                status: ok
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /servers:
+    get:
+      tags: [System]
+      operationId: listServers
+      summary: Список зарегистрированных серверов
+      description: |
+        Возвращает все ноды, зарегистрированные через `POST /register`.
+
+        Дашборд использует этот список для отрисовки карточек серверов;
+        живые метрики всех серверов идут одним потоком через `WS /metrics` на Base.
+
+        **Только ROLE=base.**
+      responses:
+        "200":
+          description: Список серверов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServersResponse"
+              example:
+                count: 2
+                servers:
+                  - name: bromage-base
+                    ip: "192.168.1.10"
+                  - name: bromage-node-1
+                    ip: "192.168.1.20"
+
+  # Канонический путь — /metrics (WS). /ws оставлен как алиас.
+  # OpenAPI не описывает WebSocket нативно; путь смоделирован как GET → 101.
+  /ws:
+    get:
+      tags: [Realtime]
+      operationId: websocketStream
+      summary: WebSocket — поток метрик (канонический путь /metrics)
+      description: |
+        Устанавливает постоянное WebSocket-соединение.
+        Сервер рассылает снимок метрик каждые `WS_INTERVAL` секунд (по умолчанию 2 с).
+
+        Доступны два равнозначных пути: **`/metrics`** (канонический, его ждёт фронт)
+        и **`/ws`** (исторический алиас).
+
+        **Клиент только читает** — отправка сообщений не обрабатывается.
+
+        **Формат кадра** (JSON-строка): поле `data` — `ServerMetricsSchema`
+        (ключ имени сервера — `name`, нагрузка — `1m/5m/15m`).
+        ```json
+        {
+          "action": "snapshot",
+          "data": { "name": "bromage-base", "ip": "192.168.1.10", "...": "..." }
+        }
+        ```
+
+        **Подключение:**
+        ```
+        ws://localhost:8080/metrics
+        wss://bromage.ru/metrics   (Base через nginx)
+        ```
+      responses:
+        "101":
+          description: Соединение установлено (Switching Protocols)
