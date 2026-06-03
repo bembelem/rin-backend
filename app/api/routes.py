@@ -46,9 +46,11 @@ async def metrics_history(limit: int = Query(default=60, ge=1, le=1000)):
 
 @router.post("/metrics/push", dependencies=[Depends(verify_api_key)])
 async def push_metrics(metrics_request: ServerMetricsRequest, request: Request):
+    # Аутентификация — по X-API-Key (verify_api_key выше).
+    # IP-гейт убран: за обратным прокси (Render/nginx) request.client.host —
+    # это IP прокси, который меняется от запроса к запросу, и проверка по нему
+    # ломается. Сервер регистрируется/обновляется при сохранении снапшота.
     ip = request.client.host
-    if not await server_registry.is_registered(ip):
-        raise HTTPException(status_code=403, detail="Server not registered")
     metrics = ServerMetricsSchema(**metrics_request.model_dump(), ip=ip)
     await metrics_repository.push(metrics)
     return {"status": "ok"}
