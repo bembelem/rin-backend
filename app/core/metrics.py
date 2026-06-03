@@ -60,13 +60,18 @@ def get_uptime() -> int:
 def get_temperature() -> float | None:
     try:
         temps = psutil.sensors_temperatures()
-        if not temps:
-            return None
-        for entries in temps.values():
-            if entries:
-                return round(entries[0].current, 1)
     except AttributeError:
         return None
+    if not temps:
+        return None
+    for entries in temps.values():
+        for entry in entries:
+            t = entry.current
+            # Отсеиваем нефизичные показания: контейнеры/виртуалки (Render и т.п.)
+            # часто отдают -273.1 (абсолютный ноль) = «датчик недоступен».
+            if t is not None and -50 <= t <= 150:
+                return round(t, 1)
+    return None
 
 
 def get_local_ip() -> str:
